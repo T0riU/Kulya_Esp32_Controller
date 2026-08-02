@@ -1,0 +1,13 @@
+{
+    "robot_mac": "AA:AA:AA:AA:AA:AA",
+    "pins": {
+        "button1": 12,
+        "button2": 14,
+        "button3": 27,
+        "button4": 26,
+        "button5": 25,
+        "joystick_x": 35,
+        "joystick_y": 34,
+        "joystick_sw": 32
+    }
+}
