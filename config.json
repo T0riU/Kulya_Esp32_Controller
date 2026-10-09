@@ -1,5 +1,14 @@
 {
     "robot_mac": "AA:AA:AA:AA:AA:AA",
+    "channel": 6,
+    "dance_count": 10,
+    "height_presets": [
+        {"name": "very_low",  "height": 58,  "raise": 17, "spread": 172},
+        {"name": "low",       "height": 87,  "raise": 33, "spread": 150},
+        {"name": "standard",  "height": 115, "raise": 50, "spread": 130},
+        {"name": "high",      "height": 143, "raise": 67, "spread": 110},
+        {"name": "very_high", "height": 172, "raise": 83, "spread": 90}
+    ],
     "pins": {
         "button1": 12,
         "button2": 14,

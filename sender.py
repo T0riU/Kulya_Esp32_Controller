@@ -12,6 +12,15 @@ except ImportError:
 CONFIG_PATH = "config.json"
 DEFAULT_CONFIG = {
     "robot_mac": "AA:AA:AA:AA:AA:AA",
+    "channel": 6,
+    "dance_count": 10,
+    "height_presets": [
+        {"name": "very_low",  "height": 58,  "raise": 17, "spread": 172},
+        {"name": "low",       "height": 87,  "raise": 33, "spread": 150},
+        {"name": "standard",  "height": 115, "raise": 50, "spread": 130},
+        {"name": "high",      "height": 143, "raise": 67, "spread": 110},
+        {"name": "very_high", "height": 172, "raise": 83, "spread": 90},
+    ],
     "pins": {
         "button1": 12, "button2": 14, "button3": 27,
         "button4": 26, "button5": 25,
@@ -22,15 +31,11 @@ DEFAULT_CONFIG = {
 NUM_LEGS = 6
 J_MODES = ["tilt", "shift", "steer", "sides"]
 
-HEIGHT_PRESETS = [
-    {"name": "low",      "height": 80,  "raise": 40, "spread": 105},
-    {"name": "standard", "height": 120, "raise": 55, "spread": 110},
-    {"name": "high",     "height": 150, "raise": 80, "spread": 85},
-]
-
 JOY_X_RAW_MIN, JOY_X_RAW_MAX = 110, 3650
 JOY_Y_RAW_MIN, JOY_Y_RAW_MAX = -250, 4195
-JOY_DEADZONE = 4
+JOY_DEADZONE_ENTER = 15
+JOY_DEADZONE_EXIT = 8
+JOY_SEND_MIN_DELTA = 3
 
 BUTTON_DEBOUNCE_MS = 200
 JOYSTICK_SEND_INTERVAL_MS = 50   # 20 Hz
@@ -63,15 +68,16 @@ class RobotLink:
     """Owns the ESP-NOW peer and sends text commands, matching the
     'gait:X;' style protocol the BLE GUI controller also speaks."""
 
-    def __init__(self, mac_str: str):
+    def __init__(self, mac_str: str,  channel: int = 6):
         self.wifi = network.WLAN(network.STA_IF)
         self.wifi.active(True)
+        self.wifi.config(channel=channel) 
 
         self.esp = espnow.ESPNow()
         self.esp.active(True)
 
         self.peer = mac_str_to_bytes(mac_str)
-        self.esp.add_peer(self.peer)
+        self.esp.add_peer(self.peer, channel=channel)
         time.sleep_ms(50)
 
     def send(self, text: str):
@@ -128,10 +134,24 @@ class Joystick:
         self.x_axis.atten(ADC.ATTN_11DB)
         self.y_axis = ADC(Pin(pin_y))
         self.y_axis.atten(ADC.ATTN_11DB)
+        # per-axis "are we currently centered" latch, for the hysteresis
+        # deadzone below
+        self._x_centered = True
+        self._y_centered = True
 
     @staticmethod
     def _map(x, in_min, in_max, out_min, out_max):
         return int((x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min)
+
+    def _apply_hysteresis(self, value, was_centered):
+        if was_centered:
+            if abs(value) < JOY_DEADZONE_ENTER:
+                return 0, True
+            return value, False
+        else:
+            if abs(value) < JOY_DEADZONE_EXIT:
+                return 0, True
+            return value, False
 
     def read(self):
         x_raw = self.x_axis.read()
@@ -140,10 +160,8 @@ class Joystick:
         jx = self._map(x_raw, JOY_X_RAW_MIN, JOY_X_RAW_MAX, -100, 100)
         jy = self._map(y_raw, JOY_Y_RAW_MIN, JOY_Y_RAW_MAX, 100, -100)
 
-        if abs(jx) < JOY_DEADZONE:
-            jx = 0
-        if abs(jy) < JOY_DEADZONE:
-            jy = 0
+        jx, self._x_centered = self._apply_hysteresis(jx, self._x_centered)
+        jy, self._y_centered = self._apply_hysteresis(jy, self._y_centered)
         return jx, jy
 
 
@@ -168,8 +186,11 @@ def main():
     cfg = load_config()
     pins = cfg.get("pins", DEFAULT_CONFIG["pins"])
     robot_mac = cfg.get("robot_mac", DEFAULT_CONFIG["robot_mac"])
+    channel = cfg.get("channel", DEFAULT_CONFIG["channel"])
+    dance_count = cfg.get("dance_count", DEFAULT_CONFIG["dance_count"])
+    height_presets = cfg.get("height_presets", DEFAULT_CONFIG["height_presets"])
 
-    robot = RobotLink(robot_mac)
+    robot = RobotLink(robot_mac, channel)
     joystick = Joystick(pins["joystick_x"], pins["joystick_y"])
 
     btn_roll = DebouncedButton(pins["button1"])
@@ -179,13 +200,13 @@ def main():
     btn_ce = DebouncedButton(pins["button5"])
     btn_joy_sw = DebouncedButton(pins["joystick_sw"])
 
-    height_cycler = Cycler(HEIGHT_PRESETS)
+    height_cycler = Cycler(height_presets)
     wave_leg_cycler = Cycler(list(range(NUM_LEGS)))
-    dance_leg_cycler = Cycler(list(range(NUM_LEGS)))
+    dance_cycler = Cycler(list(range(dance_count)))
     jmode_cycler = Cycler(J_MODES)
     ce_expanded = True
 
-    last_joy_value = (None, None)
+    last_joy_sent = (0, 0)   # last value actually transmitted over ESP-NOW
     last_joy_send_ms = time.ticks_ms()
 
     print("Kulya RC remote - setting up initial robot state")
@@ -208,8 +229,10 @@ def main():
             robot.send("gait:WAVE;leg_num:{};".format(leg))
 
         if btn_dance.poll():
-            leg = dance_leg_cycler.next()
-            robot.send("gait:DANCE;leg_num:{};".format(leg))
+            dance = dance_cycler.next()
+            robot.send("dance_id:{};".format(dance))
+            time.sleep_ms(50)
+            robot.send("gait:DANCE;")
 
         if btn_ce.poll():
             if ce_expanded:
@@ -227,9 +250,14 @@ def main():
         now = time.ticks_ms()
         if time.ticks_diff(now, last_joy_send_ms) >= JOYSTICK_SEND_INTERVAL_MS:
             jx, jy = joystick.read()
-            if (jx, jy) != last_joy_value:
+            last_x, last_y = last_joy_sent
+            became_centered = (jx, jy) == (0, 0) and (last_x, last_y) != (0, 0)
+            moved_enough = (abs(jx - last_x) >= JOY_SEND_MIN_DELTA or
+                             abs(jy - last_y) >= JOY_SEND_MIN_DELTA)
+
+            if became_centered or moved_enough:
                 robot.send("J_XY:{}|{}".format(jx, jy))
-                last_joy_value = (jx, jy)
+                last_joy_sent = (jx, jy)
             last_joy_send_ms = now
 
         time.sleep_ms(MAIN_LOOP_POLL_MS)
